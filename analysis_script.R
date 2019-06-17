@@ -1,11 +1,16 @@
 options(encoding = "UTF-8")
 
-library(MASS)
+# library(MASS)
 library(tidyverse)
-library(magrittr)
-library(ggjoy)
 library(tidytext)
 library(hunspell)
+library(lmerTest)
+library(ggbeeswarm)
+
+source("script/calclulate_overdispersion.R")
+source("script/ggcoefplot.R")
+
+theme_set(theme_light())
 
 # Read data
 tom_df <- readxl::read_xlsx("data/tom_final.xlsx", 1)
@@ -13,10 +18,13 @@ stimuli_df <- read_csv("data/00_stimuli_presentation_order_per_tester_default.cs
 
 # Dictionaries
 hungarian_dict <- dictionary("data/dictionaries/hu_HU.dic")
-hungarian_stopwords <- read_lines("data/dictionaries/hungarian_stopwords.dat") %>% data_frame(stem = .)
+hungarian_stopwords <- read_lines("data/dictionaries/hungarian_stopwords.dat") %>% 
+                        tibble(stem = .)
 # Load sentiment dictionaries (downloaded from http://opendata.hu/dataset/hungarian-sentiment-lexicon, 2016/07/08)
-senti_pos <- read_lines("data/dictionaries/PrecoPos.txt") %>% data_frame(stem = ., sentiment = 1L)
-senti_neg <- read_lines("data/dictionaries/PrecoNeg.txt") %>% data_frame(stem = ., sentiment = -1L)
+senti_pos <- read_lines("data/dictionaries/PrecoPos.txt") %>% 
+                tibble(stem = ., sentiment = 1L)
+senti_neg <- read_lines("data/dictionaries/PrecoNeg.txt") %>% 
+                tibble(stem = ., sentiment = -1L)
 senti <- bind_rows(senti_pos, senti_neg)
 
 films <- c("FD_0CU", "FD_5CU", "FD_10CU")
@@ -30,59 +38,128 @@ seen <-
         filter(stimulus %in% films) %>% 
         drop_na() %>% 
         select(-seen) %>% 
-        mutate(Close_up = if_else(stimulus == films[1], cu_levels[1], cu_levels[2]) %>% factor(levels = cu_levels),
-               stimulus = stimulus %>% factor(., levels = films, labels = film_titles))
+        mutate(Close_up = if_else(stimulus == films[1], cu_levels[1], cu_levels[2]) %>%
+                          factor(levels = cu_levels),
+               stimulus = factor(stimulus, levels = films, labels = film_titles))
 
 df <- 
         tom_df %>% 
-        left_join(seen, by = "TestId")
-        
-# Showing densities
-df %>% 
-        select(Close_up, Affective_female:Intention_male) %>% 
-        gather(tom_type, value, -Close_up) %>% 
+        left_join(seen, by = "TestId") %>% 
+        rename(characters = Length) %>% 
+        mutate(words = str_count(Story, '\\w+'))
+
+df_long <-
+        df %>% 
+        gather(tom_type, value, Affective_female:Intention_male) %>% 
+        separate(tom_type, c("tom_subtype", "object"), sep = "_",remove = FALSE) %>% 
+        mutate(object = fct_relevel(object, "male"),
+               tom_subtype = fct_relevel(tom_subtype, "Intention"))
+
+df_long %>% 
+        mutate(tom_type = fct_reorder(tom_type, value)) %>% 
         ggplot() +
-        aes(x = value, y = tom_type) +
-        geom_joy() +
-        facet_wrap(~Close_up) +
-        ggtitle("Density of tom categories by movie version")
+        aes(x = tom_type, y = value, fill = tom_type) +
+        geom_boxplot(width = .5, outlier.size = 1) +
+        geom_quasirandom(size = 1, alpha = .3) +
+        scale_fill_viridis_d() +
+        coord_flip() +
+        facet_wrap(~stimulus) +
+        labs(x = NULL,
+             title = "Density of tom categories by movie version")
+       
+# Distribution of TOM
+df_long %>% 
+        group_by(stimulus, TestId, characters, words) %>% 
+        summarise(tom = sum(value)) %>% 
+        ggplot() +
+        aes(x = tom) +
+        geom_histogram(binwidth = .5)
 
-glm_aff_fem <- glm(Affective_female ~ stimulus + offset(log(Length)), family = "poisson",data = df)
-summary(glm_aff_fem)
-glm_aff_fem <- glm(Affective_female ~ Close_up + offset(log(Length)), family = "poisson",data = df)
-summary(glm_aff_fem)
-AER::dispersiontest(glm_aff_fem, alternative = "greater")
-
-# We have to run a negative binomial regression, since dispersion is 1.9 (variance is almost 2x the mean). This parameter was calculated using quasipoisson family.
-glm_nb_aff_fem <- glm.nb(Affective_female ~ stimulus + offset(log(Length)), data = df)
-glm_nb_aff_fem <- glm.nb(Affective_female ~ Close_up + offset(log(Length)), data = df)
-summary(glm_nb_aff_fem)
-anova(glm_nb_aff_fem)
-
+# Distribution of words
 df %>% 
-        group_by(stimulus) %>% 
-        summarise(Mean = mean(Affective_female, na.rm = T),
-                  Se = sd(Affective_female, na.rm = T)/sqrt(n())) %>% 
-        ggplot(data = .) +
-                aes(x = stimulus, y = Mean, ymin = Mean - Se, ymax = Mean + Se) +
-                geom_errorbar(width = .5) +
-                geom_col() +
-                theme_minimal() +
-                labs(x = NULL, y = "Affective mentalizaton to the female character") +
-                ggtitle("Differences in the mean affective mentalization response to the female character (SE)")
+        ggplot() +
+        aes(x = log(words)) +
+        geom_histogram(bins = 20)
+
+# Association between words and characters
+ggplot(df) +
+        aes(x = words, y = characters) +
+        geom_point()
+
+
+# Hypothesis tests ------------------------------------------------------------------
+# All TOM
+all_tom_pois <-
+        df_long %>% 
+        group_by(stimulus, TestId, characters, words) %>% 
+        summarise(tom = sum(value)) %>% 
+        glm(tom ~ stimulus, 
+            offset = log(words), 
+            family = "poisson", 
+            data = .)
+
+summary(all_tom_pois)
+broom.mixed::tidy(all_tom_pois, exponentiate = TRUE, conf.int = TRUE)
+calclulate_overdispersion(all_tom_pois) # Calculate overdiscpersion using Bolker's function
+# There is a considerable overdispersion, so we need to use negative binomial regression
+# We have to run a negative binomial regression, since dispersion is significantly larger than 1 (variance is 1.4x the mean). 
+
+all_tom_nb <-
+        df_long %>% 
+        group_by(stimulus, TestId, characters, words) %>% 
+        summarise(tom = sum(value)) %>% 
+        MASS::glm.nb(tom ~ stimulus + 
+                     offset(log(words)), 
+            data = .)
+
+summary(all_tom_nb)
+broom.mixed::tidy(all_tom_nb, exponentiate = TRUE, conf.int = TRUE)
+
+# TOM by object
+object_tom_pois <-
+        df_long %>% 
+        group_by(stimulus, TestId, object, characters, words) %>% 
+        summarise(tom = sum(value)) %>% 
+        glmer(tom ~ stimulus * object + (1|TestId), 
+            offset = log(words), 
+            family = "poisson", 
+            data = .)
+
+summary(object_tom_pois)
+broom.mixed::tidy(object_tom_pois, exponentiate = TRUE, conf.int = TRUE)
+calclulate_overdispersion(object_tom_pois) # No overdispersion
+
+ggcoefplot(object_tom_pois)
+
+# TOM by object and type
+type_tom_pois <-
+        df_long %>% 
+        group_by(stimulus, TestId, object, tom_subtype, characters, words) %>% 
+        summarise(tom = sum(value)) %>% 
+        glmer(tom ~ stimulus * object * tom_subtype + (1|TestId), 
+              offset = log(words),
+              family = "poisson", 
+              data = .)
+
+summary(type_tom_pois)
+broom.mixed::tidy(type_tom_pois, exponentiate = TRUE, conf.int = TRUE)
+
+ggcoefplot(type_tom_pois)
+
+calclulate_overdispersion(type_tom_pois) # No overdispersion
         
 
 ## Preparing the text for sentiment analysis
 # The text is already annotated by magyarlanc API, so we just load the files
 words <- 
-        data_frame(file = list.files("data/magyarlanc annotation")) %>% 
+        tibble(file = list.files("data/magyarlanc annotation")) %>% 
         rowwise() %>% 
         mutate(annotation = map(., ~read_tsv(paste0("data/magyarlanc annotation/", file), col_names = c("word", "stem", "type", "full_annot")), trim_ws = TRUE, encoding = "UTF-8")) %>% 
-        mutate(TestId = file %>% gsub(".txt","", .)) %>% 
+        mutate(TestId = str_remove(file, ".txt")) %>% 
         ungroup() %>% 
         unnest(annotation) %>% 
         filter(!type %in% c("PUNCT","X","_","CONJ","INTJ","NUM")) %>% # Remove punctuation and others
-        anti_join(hungarian_stopwords, by = "stem") %>% # Remove hungarian stopwords
+        # anti_join(hungarian_stopwords, by = "stem") %>% # Remove hungarian stopwords
         rowwise() %>% 
         mutate( spelling = hunspell_check(stem, dict = hungarian_dict), # Spell check
                 stem = if_else(!spelling,  # For incorrect spelling, use the first suggestion
@@ -101,7 +178,7 @@ words <-
 words %>%
         summarise(sentiment = sum(sentiment, na.rm = T)) %>% # Add up sentiments into one num/tester
         left_join(df, by = "TestId") %>% 
-        lm(sentiment/Length ~ stimulus, data = .) %>%
+        lm(sentiment/characters ~ stimulus, data = .) %>%
         summary()
 
 words %>%
@@ -113,8 +190,8 @@ words %>%
         count(sentiment) %>% 
         spread(sentiment, n) %>% 
         mutate_at(vars(negative, positive), funs(if_else(is.na(.), 0L, .))) %>% 
-        left_join(tom_df %>% select(TestId, Length)) %>% 
-        glm.nb(positive ~ stimulus + offset(log(Length)), data = .) %>%
+        left_join(tom_df %>% select(TestId, characters)) %>% 
+        glm.nb(positive ~ stimulus + offset(log(characters)), data = .) %>%
         summary()
         
         
