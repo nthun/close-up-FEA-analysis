@@ -1,7 +1,7 @@
 # Overdispersion calculating function, written by Bolker
 # https://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#overdispersion
 
-calclulate_overdispersion <- function(model) {
+calculate_overdispersion <- function(model) {
         rdf <- df.residual(model)
         rp <- residuals(model,type="pearson")
         Pearson.chisq <- sum(rp^2)
