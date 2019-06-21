@@ -1,0 +1,351 @@
+---
+title: "Close-up shots and empathy affect enjoyment of movies"
+author: "Tamas Nagy"
+date: "6/20/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)
+library(tidyverse)
+library(lmerTest)
+library(ggbeeswarm)
+source("script/calculate_overdispersion.R")
+# TODO: Add participant characteristics
+```
+
+# Read and process data
+Skip this part if not interested in the preprocessing
+
+```{r set_defaults, message=FALSE, warning=FALSE}
+films <- c("0 close-ups" = "FD_0CU", "5 close-ups" = "FD_5CU", "10 close-ups" = "FD_10CU")
+theme_set(theme_light())
+```
+
+```{r read_data, message=FALSE, warning=FALSE}
+stimuli_df <- read_csv("data/00_stimuli_presentation_order_per_tester_default.csv")
+tom_df <- readxl::read_xlsx("data/tom_final.xlsx", 1)
+raw_phys <- vroom::vroom("data/06_all_metrics_default_flat_header.csv")
+sequences <- read_csv("data/sequences.csv") %>% 
+             mutate(epoch_rel = as.numeric(time),
+                    stimulus = fct_inorder(stimulus),
+                    cu = fct_inorder(cu)) %>% 
+             select(-time)
+```
+
+```{r clean_data, message=FALSE, warning=FALSE}
+# Get group assignment
+seen <- 
+        stimuli_df %>% 
+        gather(TestId, seen, -stimulus) %>% 
+        filter(stimulus %in% films) %>% 
+        drop_na() %>% 
+        select(-seen) %>% 
+        mutate(stimulus = factor(stimulus, levels = films, labels = names(films)))
+
+# Process questionnaire data
+qdata <-
+        read_csv("data/02_survey_results_all_renamed_columns_default_flat_header.csv") %>% 
+        set_names(str_remove(names(.), "_nan")) %>% 
+        # Correct naming errors
+        rename(Empathy_FS01 = Empathy_FS01R, Empathy_PT15R = Empathy_PT15) %>%
+        set_names(str_replace(names(.), "DS","PD")) %>% 
+        set_names(str_replace(names(.), "NarrInvolvement_Pleasure", "Pleasure")) %>% 
+        # Correct variable types and factor levels
+        mutate(Sex = recode(QDemo01, `Férfi` = "Male", `Nő` = "Female"),
+               TestId = as.character(TestId)) 
+
+# Process TOM coding data
+tom_long <- 
+        tom_df %>% 
+        rename(characters = Length) %>% 
+        mutate(words = str_count(Story, '\\w+')) %>% 
+        gather(tom_type, value, Affective_female:Intention_male) %>% 
+        separate(tom_type, c("tom_subtype", "object"), sep = "_",remove = FALSE)
+
+# Process psychological scales
+psy_scales <- 
+        qdata %>%
+        select(TestId, 
+               starts_with("Empathy"), 
+               starts_with("NarrInvolvement"), 
+               starts_with("Pleasure"),
+               -ends_with("Time")) %>% 
+        # Extract numeric answer
+        mutate_at(vars(-TestId), ~as.numeric(str_extract(., "\\d"))) %>%  
+        # Recode reverse coded variables
+        mutate_at(vars(matches("^Empathy.*R$")), ~4 - .) %>% 
+        mutate_at(vars(matches("^NarrInvolvement*R$")), ~8 - .) %>% 
+        mutate_at(vars(matches("^Pleasure*R$")), ~8 - .) %>% 
+        # Calculate the scales
+        transmute(TestId,
+                  Empathy = rowMeans(select(., matches("Empathy_"))),
+                  `Narrative engagement` = rowMeans(select(., matches("NarrInvolvement_"))),
+                  Enjoyment = rowMeans(select(., contains("Pleasure"))),
+                  # Empathy subscales
+                  `Fantasy scale` = rowMeans(select(., contains("_FS"))),  
+                  `Perspective taking` = rowMeans(select(., contains("_PT"))),
+                  `Empathic concern` = rowMeans(select(., contains("_EC"))),
+                  `Personal distress` = rowMeans(select(., contains("_PD"))),
+                  # Narrative engagement subsales
+                  `Narrative understanding` = rowMeans(select(., contains("NarrUnderst"))),
+                  `Narrative presence` = rowMeans(select(., contains("NarrPresence"))),
+                  `Attention focus` = rowMeans(select(., contains("AttFocus"))),
+                  `Emotional involvement` = rowMeans(select(., contains("EmotInvolv")))) 
+
+# All psychological data
+psy <-
+        tom_long %>% 
+        left_join(seen, by = "TestId") %>% 
+        group_by(stimulus, TestId, characters, words) %>% 
+        summarise(tom = sum(value)) %>% 
+        ungroup() %>% 
+        left_join(psy_scales, by = "TestId") %>%  
+        mutate(emp_cut = cut(x = Empathy, 
+                             breaks = c(-Inf, 2.107, 2.598, Inf),
+                             labels = c("Low", "Moderate", "High")))
+
+# Frontal EEG asymmetry (approach motivation)
+fea <-
+        raw_phys %>% 
+        filter(stimulus %in% films) %>% 
+        select(stimulus, 
+               epoch_rel,
+               matches("^\\d{4}_FEA$")) %>%
+        gather(TestId, raw_fea, -stimulus, -epoch_rel, na.rm = TRUE) %>% 
+        mutate(TestId = str_extract(TestId, "\\d+"),
+               stimulus = factor(stimulus, levels = films, 
+                                           labels = names(films))) %>% 
+        left_join(sequences, by = c("stimulus","epoch_rel")) %>% 
+        group_by(TestId, stimulus) %>% 
+        mutate(fea = scale(raw_fea)) %>% 
+        fill(sequence, cu, .direction = "up") %>%
+        ungroup() %>% 
+        drop_na(sequence)
+
+
+```
+
+```{r visualize_psy_data, message=FALSE, warning=FALSE}
+psy %>% 
+        transmute(tom, Empathy, Enjoyment, `Narrative engagement`) %>% 
+        GGally::ggpairs()
+```
+
+
+# ENJOYMENT
+In general, the 10 close-up version was enjoyed more than the 0 close-up version
+
+```{r}
+lm(scale(Enjoyment) ~ scale(Empathy) * stimulus, data = psy) %>% 
+        summary()
+```
+
+```{r}
+ggplot(psy) +
+        aes(x = stimulus, y = scale(Enjoyment), fill = stimulus) +
+        geom_violin() +
+        geom_boxplot(width = .5) +
+        geom_beeswarm() +
+        labs(title = "Differences in enjoyment by film version",
+             subtitle = "The 10 close-up version was enjoyed more than the no close-up version",
+             y = "Standardized enjoyment",
+             x = "Number of close-ups",
+             fill = "Number of close-ups") + 
+        guides(fill = FALSE)
+```
+
+```{r}
+ggplot(psy) +
+        aes(x = scale(Empathy), y = scale(Enjoyment), color = stimulus) +
+        geom_point() +
+        geom_smooth(method = "lm") +
+        labs(title = "Empathy affects enjoyment more when there are less close-ups",
+             subtitle = "In general, more empathic participants enjoyed the movie more, but everyone enjoyed the 10 close-up version the most.",
+             x = "Standardised empathy",
+             y = "Standardized enjoyment",
+             color = "Number of close-ups")
+```
+
+# NARRATIVE ENGAGEMENT
+Empathy was strongly associated with narrative enagement, but there was no effect of stimulus.
+
+```{r}
+lm(scale(`Narrative engagement`) ~ scale(Empathy) * stimulus, data = psy) %>% 
+        summary()
+```
+
+```{r}
+ggplot(psy) +
+        aes(x = scale(Empathy), y = scale(`Narrative engagement`), color = stimulus) +
+        geom_point() +
+        geom_smooth(method = "lm") +
+        labs(title = "",
+             x = "Standardised empathy",
+             y = "Standardized narrative engagement",
+             color = "Number of close-ups")
+```
+
+# TOM RESPONSES
+We used posisson regression to investigete the effect of stimulus on TOM answers. We used the log number of words to correct for the difference in length of answers. We investigated the assumption of overdispersion using the formula provided on the following link: https://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#overdispersion
+
+```{r}
+tom_pois <- glm(tom ~ scale(Empathy) * stimulus, 
+                offset = log(words),
+                data = psy,
+                family = "poisson")
+
+summary(tom_pois)
+
+calculate_overdispersion(tom_pois)
+```
+
+The outcome variable was overdispersed, therefore negative binomial regression was used that can handle overdispersed data.
+
+When analysed using negative binomial regression, the 5 close-up version was associated with the most TOM responses in the open ended snaswers.
+
+```{r}
+tom_nb <- MASS::glm.nb(tom ~ scale(Empathy) * stimulus + 
+                       offset(log(words)),
+                       data = psy)
+
+summary(tom_nb)
+```
+
+```{r}
+ggplot(psy) +
+        aes(x = scale(Empathy), y = tom, color = stimulus) +
+        geom_point() +
+        geom_smooth(method = "lm") +
+        labs(title = "Participants who saw the 5 close-up version used more TOM expressions",
+             subtitle = "Empathy was not associated with more TOM answers",
+             x = "Standardised empathy",
+             y = "Frequency of TOM in open ended answer",
+             color = "Number of close-ups")
+```
+
+```{r}
+ggplot(psy) +
+        aes(x = stimulus, y = tom, fill = stimulus) +
+        geom_violin() +
+        geom_boxplot(width = .2) +
+        geom_beeswarm() +
+        labs(title = "Differences in TOM responses by film version",
+             subtitle = "The 10 close-up version was enjoyed more than the no close-up version",
+             y = "Standardized enjoyment",
+             x = "Number of close-ups",
+             fill = "Number of close-ups") + 
+        guides(fill = FALSE)
+```
+
+# EEG frontal asymmetry (approach motivation)
+## Distribution of FEA
+
+```{r}
+fea %>% 
+        ggplot() +
+        aes(x = fea) +
+        geom_histogram() +
+        facet_wrap(~stimulus)
+```
+
+## FEA according to sequence and stimuli
+
+The effect of CU-s was investigated within each movie sequence, which did, or did not include a close-up
+
+We used a mixed-effect model with a three level nested random structure, where the film sequence was crossed (everyone saw).
+Level 1 was the individual participants with Empathy as a random slope
+Level 2 was the sequence
+Level 3 was the stimuli in which the sequence was embedded
+
+```{r}
+fea %>% 
+        group_by(TestId, stimulus, sequence, cu) %>% 
+        summarise(fea_mean = mean(fea, na.rm = TRUE)) %>% 
+        ungroup() %>% 
+        left_join(psy, by = c("TestId", "stimulus")) %>% 
+        lmer(fea_mean ~ stimulus * sequence * cu + scale(Empathy) + (scale(Empathy)|TestId) + (1|stimulus/sequence), 
+             data = .) %>% 
+        summary()
+```
+
+
+```{r}
+fea %>% 
+        group_by(stimulus, sequence) %>% 
+        summarise(fea_mean = mean(fea),
+                  fea_se = sd(fea)/sqrt(n())) %>% 
+        ungroup() %>% 
+        ggplot() +
+        aes(x = sequence, y = fea_mean, 
+            ymin = fea_mean - fea_se, ymax = fea_mean + fea_se,
+            color = stimulus) +
+        geom_line(size = 1.5) +
+        geom_pointrange(size = 1.2) +
+        labs(title = "There is no clear pattern for FEA across film segments and stimuli",
+             y = "Frontal EEG asymmetry (Approach motivation)",
+             x = "Film sequence/scene",
+             color = "Number of close-ups")
+```
+
+
+# The FEA was investigated by summarizeing data with and without close-ups
+We found no evidence that close-ups were associated  with higher CU, when controlling empathy and stimulus.
+
+
+```{r}
+fea %>% 
+        filter(sequence < 11) %>% 
+        group_by(TestId, stimulus, cu) %>% 
+        summarise(fea_mean = mean(fea, na.rm = TRUE)) %>% 
+        ungroup() %>% 
+        left_join(psy, by = c("TestId", "stimulus")) %>% 
+        lmer(scale(fea_mean) ~ stimulus * cu * scale(Empathy) + (1|TestId) + (1|stimulus/cu), 
+             data = .) %>% 
+        summary()
+```
+
+
+```{r}
+fea %>% 
+        group_by(TestId, stimulus, cu) %>% 
+        summarise(fea_mean = mean(fea, na.rm = TRUE)) %>% 
+        ungroup() %>%
+        left_join(psy, by = c("TestId", "stimulus")) %>% 
+        ggplot() +
+        aes(x = scale(Empathy), y = fea_mean, color = cu) +
+        geom_point() +
+        geom_smooth(method = "lm") +
+        facet_wrap(~stimulus) +
+        labs(title = "Empathy moderates the effect of stimuli on FEA",
+             subtitle = "Close-ups are associated with larger FEA in more empathic participants\nUnfortunetely this effect is only based on the one no-close-up sequence in the 10 close-up version",
+             x = "Standardised empathy",
+             y = "Frontal EEG asymmetry (approach motivation)",
+             color = "Segments")
+
+```
+
+The same thing with Empathy as a factor of three levels (based on IQR)
+```{r }
+
+fea %>% 
+        left_join(psy, by = c("TestId", "stimulus")) %>% 
+        group_by(stimulus, cu, emp_cut) %>% 
+        summarise(fea_mean = mean(fea), fea_se = sd(fea)/sqrt(n())) %>% 
+        ungroup() %>% 
+        ggplot() +
+        aes(x = cu, y = fea_mean, color = emp_cut, 
+            ymin = fea_mean - fea_se, ymax = fea_mean + fea_se) +
+        geom_pointrange(position = position_dodge(width = .9)) +
+        geom_line() +
+        facet_wrap(~stimulus) +
+        labs(title = "Empathy moderates the effect of stimuli on FEA",
+             subtitle = "",
+             x = "Segment",
+             y = "Frontal EEG asymmetry (approach motivation)",
+             color = "Empathy group")
+```
+
